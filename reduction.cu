@@ -17,8 +17,9 @@
 #define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
 
 #define CONST_BYTES 16*16*2
-#define SKEW_HALF 8                     //offset for avoding bank conflict
+#define SKEW_HALF 8                      //offset for avoding bank conflict
 #define SHMEM_STRIDE 16+SKEW_HALF
+#define INPUT_STORE_POINT WMMA_M
 
 #define checkCudaErrors(status) {                                      \
     std::stringstream _error;                                          \
@@ -87,10 +88,15 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       typedef int4 copy_t;//vector pointer for fast copy
       //load P matrix to shared memory
       int shmem_row = laneId/2;
-      //记住这个快速copy格式！
-      copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);
-      *((copy_t *)&shmem[shmem_row][0]+laneId) = *lane_ptr;
+      //just remember this fixed copy approach!!
+      copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);          //one thread copy a int4 = 16bytes = 8 fp16.
+      *((copy_t *)&shmem[shmem_row][0]+laneId%2) = *lane_ptr;
+
+      //load input
+      lane_ptr = (copy_t *)(input+laneId*8);
+      *((copy_t *)&shmem[INPUT_STORE_POINT+shmem_row][0]+laneId%2) = *lane_ptr;
        __syncthreads();  
+
 
       wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
       wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
@@ -102,42 +108,60 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       
       wmma::load_matrix_sync(P_frag, &shmem[0][0], SHMEM_STRIDE);
       wmma::load_matrix_sync(PT_frag, &shmem[0][0], SHMEM_STRIDE);
-      wmma::mma_sync(C_frag, P_frag, PT_frag, C_frag);
+      wmma::load_matrix_sync(A_frag, &shmem[INPUT_STORE_POINT][0], SHMEM_STRIDE);
 
+      wmma::mma_sync(C_frag, P_frag, A_frag, C_frag);
+      
       wmma::store_matrix_sync(output, C_frag, 16, wmma::mem_row_major);
       
       
     }
+
+
+
+
     //printf("%f ,", (float)P_d[threadIdx.x]);
     __syncthreads();
     if(threadIdx.x==0)
       printf("kernel complete!\n");
-
-
 }
 
 
 
+__host__ void init_input(half *input){
+  for(float i=0.0;i<256;i++){
+    *(input+(int)i) = (half)i;
+  }
+}
+
+
 int main(){
 
-    half *input;
+    half *input_h;
     int input_size = 256;
     float *output_h;
     half *input_d;
     float *output_d;
 
     output_h = (float*)malloc(2*CONST_BYTES);
+    input_h = (half*)malloc(2*CONST_BYTES);
+    init_input(input_h);
+    //malloc GPU and copy contant data to constant memory
     checkCudaErrors(cudaMalloc(&input_d, CONST_BYTES));
     checkCudaErrors(cudaMalloc(&output_d, CONST_BYTES*2));
-
     checkCudaErrors(cudaMemcpyToSymbol(P_d, P_h, CONST_BYTES));
-    checkCudaErrors(cudaMemcpyToSymbol(PT_d, PT_h, CONST_BYTES));
 
-    checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input, output_d, input_size)) );
+    //copy input to gpu
+    checkCudaErrors(cudaMemcpy(input_d, input_h, CONST_BYTES, cudaMemcpyHostToDevice));
+
+    //launch kernel 
+    checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, input_size)) );
     checkCudaErrors(cudaDeviceSynchronize());
-    
+
+    //copy result back to cpu
     checkCudaErrors(cudaMemcpy(output_h, output_d, 2*CONST_BYTES, cudaMemcpyDeviceToHost) );
 
+    //check the computing result
     for(int i=0;i<16;++i){
         for(int j=0;j<16;++j){
             std::cout<<output_h[16*i+j]<<",";
@@ -146,7 +170,7 @@ int main(){
     }
     
 
-    std::cout<<"all complete!"<<std::endl;
+    std::cout<<std::endl<<"all complete!"<<std::endl;
 
 
 
