@@ -74,14 +74,14 @@ half P_h[16*16]={1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
 
 
 
-__global__ void compute_reductions16N_warp(const half *input, float *output, int input_size){
+__global__ void compute_reductions16N_warp(const half *input, float *output, int N){
 
      extern __shared__ half shmem[][16 + SKEW_HALF];
 
     const unsigned int warpId = threadIdx.x / WARP_SIZE;
     const unsigned int laneId = threadIdx.x % WARP_SIZE;
 
- 
+    
 
     if(warpId==0){
 
@@ -93,8 +93,14 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       *((copy_t *)&shmem[shmem_row][0]+laneId%2) = *lane_ptr;
 
       //load input
-      lane_ptr = (copy_t *)(input+laneId*8);
-      *((copy_t *)&shmem[INPUT_STORE_POINT+shmem_row][0]+laneId%2) = *lane_ptr;
+      if(laneId < N<<1){
+        lane_ptr = (copy_t *)(input+laneId*8);
+        *((copy_t *)&shmem[INPUT_STORE_POINT+shmem_row][0]+laneId%2) = *lane_ptr;
+      }
+      else{
+        *((copy_t *)&shmem[INPUT_STORE_POINT+shmem_row][0]+laneId%2) = make_int4(0,0,0,0);//padding with 0;
+      }
+
        __syncthreads();  
 
 
@@ -138,7 +144,7 @@ __host__ void init_input(half *input){
 int main(){
 
     half *input_h;
-    int input_size = 256;
+    int N = 2;
     float *output_h;
     half *input_d;
     float *output_d;
@@ -146,6 +152,7 @@ int main(){
     output_h = (float*)malloc(2*CONST_BYTES);
     input_h = (half*)malloc(2*CONST_BYTES);
     init_input(input_h);
+
     //malloc GPU and copy contant data to constant memory
     checkCudaErrors(cudaMalloc(&input_d, CONST_BYTES));
     checkCudaErrors(cudaMalloc(&output_d, CONST_BYTES*2));
@@ -155,7 +162,7 @@ int main(){
     checkCudaErrors(cudaMemcpy(input_d, input_h, CONST_BYTES, cudaMemcpyHostToDevice));
 
     //launch kernel 
-    checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, input_size)) );
+    checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, N)) );
     checkCudaErrors(cudaDeviceSynchronize());
 
     //copy result back to cpu
