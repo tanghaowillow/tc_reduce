@@ -35,5 +35,8 @@ run: reduction.cu
 	$(NVCC) -o run reduction.cu -arch=sm_70 -L$(LIBDIR_CUDA) -lcudart -lcuda -lcublas -lcudnn
 
 clean:
-	#find . -name "*.o" -exec rm -f '{}' ';'
-	#rm -f run
+	find . -name "*.o" -exec rm -f '{}' ';'
+
+	rm -f run
+
+
