@@ -56,21 +56,21 @@ __constant__  half P_d[16*16];
 //__constant__  half PT_d[16*16];
 
 half P_h[16*16]={1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
                 };
 
 
@@ -133,7 +133,7 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
 }
 
 
-__global__ void compute_reductions256N_warp(const half *input, float *output, int N){//N should be smaller than 32
+__global__ void compute_reductions256N_warp(const half *input, float *output, int N){
 
   extern __shared__ half shmem[][16 + SKEW_HALF];
   half *free_use = (half*)&shmem[FREE_USE][0];
@@ -154,24 +154,23 @@ __global__ void compute_reductions256N_warp(const half *input, float *output, in
 
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag[32];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag;
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> V_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> Vn_frag;
     wmma::fill_fragment(C_frag, 0.0f);
-    wmma::fill_fragment(Vn_frag, 0.0f);//必须赋初值
+    //wmma::fill_fragment(Vn_frag, 0.0f);
     
     wmma::load_matrix_sync(P_frag, &shmem[0][0], SHMEM_STRIDE);
     wmma::load_matrix_sync(PT_frag, &shmem[0][0], SHMEM_STRIDE);
     //load input to frags
-    for(int i=0;i<N;i++)
-      wmma::load_matrix_sync(A_frag[i], input+i*256, 16);
+    for(int i=0;i<N;i++){
+      wmma::load_matrix_sync(A_frag, input+i*256, 16);  
+      wmma::mma_sync(Vn_frag, P_frag, A_frag, Vn_frag);//perform Vn = P x An+Vn-1
+    }
 
-    for(int i=0;i<N;i++)  
-      wmma::mma_sync(Vn_frag, P_frag, A_frag[i], Vn_frag);//perform Vn = P x An+Vn-1
-
-    wmma::store_matrix_sync(free_use, Vn_frag, 16, wmma::mem_row_major);//store Vn to shared memory
-    wmma::load_matrix_sync(V_frag, free_use, 16);//load V from Vn
+    wmma::store_matrix_sync(free_use, Vn_frag, 16, wmma::mem_row_major);//store Vn to shared memory, because as an accumulator frag Vn cannot be used for computing multiplication
+    wmma::load_matrix_sync(V_frag, free_use, 16);//load V from Vn as a matrix_a type 
   
     wmma::mma_sync(C_frag, V_frag, PT_frag, C_frag);//perform output = V x PT 
     
@@ -179,9 +178,9 @@ __global__ void compute_reductions256N_warp(const half *input, float *output, in
 
   }
 
-  __syncthreads();
+  
   //if(threadIdx.x==0)
-    //printf("%f kernel complete!\n", Vn_frag[4]);
+    //printf("%f kernel complete!\n", (float)input[N*256-1]);
 }
 
 
@@ -234,7 +233,7 @@ __global__ void shared_to_frag(const half *input, float *output, const int N){
 
 __host__ void init_input(half *input, int size){
   for(float i=0.0;i<size;i++){
-    *(input+(int)i) = (half)(280.0);
+    *(input+(int)i) = (half)(i);
   }
 }
 
