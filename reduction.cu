@@ -232,7 +232,17 @@ __global__ void compute_reductions256N_block(const half *input, float *output, i
   
   if(laneId == 0)
     partial_sums[warpId] = C_frag.x[0];
+    __syncthreads();
   
+  float mysum = 0.0f;
+  if(threadIdx.x < 8){
+    mysum = partial_sums[threadIdx.x];
+    for(int offset = 4; offset > 0; offset >>= 1)
+      mysum += __shfl_down_sync(0xffffffff, mysum, offset, 8);
+  }
+
+  if(threadIdx.x == 0)
+    *output = mysum;
 }
 
 /******************************************
@@ -343,32 +353,23 @@ int sum_wmma_block(half *input, int input_size){
 
 int main(){
 
-    int N = 9;
+    int N = 8;
     int input_size = N*256;
-
 
     half *input_h = (half*)malloc(2*input_size);
     int *input_h_cub = (int*)malloc(4*input_size);
     init_input_half(input_h, input_size);
     init_input_int(input_h_cub, input_size);
 
-
+    float res = sum_wmma_block(input_h, input_size);
+    
     //launch kernel
     //checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, 15)) );
     //checkKernelErrors( (compute_reductions256N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, N)) );
     //checkKernelErrors( (compute_reductions256N_block<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, N)) );
     checkCudaErrors(cudaDeviceSynchronize());
 
-
-    /*
-    //print computing result
-    for(int i=0;i<16;++i){
-        for(int j=0;j<16;++j){
-            std::cout<<output_h[16*i+j]<<",";
-        }
-        std::cout<<std::endl;
-    }
-   */
+    std::cout<<"result of reduction with tensor core: "<<res<<std::endl;
     std::cout<<std::endl<<"all complete!"<<std::endl;
 
     free(input_h);
@@ -377,4 +378,4 @@ int main(){
 }
 
 //遗留问题 256N超过一个256就不对
-//block-level reduction
+//CUB block level
