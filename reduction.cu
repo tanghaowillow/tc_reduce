@@ -5,7 +5,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <mma.h>
-#include <cuda_profiler_api.h> 
+#include <cuda_profiler_api.h>
+#include <cub/cub.cuh> 
 
 #define WMMA_M 16
 #define WMMA_N 16
@@ -53,7 +54,6 @@ using namespace nvcuda;
 
 // malloc gpu constant memory
 __constant__  half P_d[16*16];
-//__constant__  half PT_d[16*16];
 
 half P_h[16*16]={1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,
                 0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
@@ -91,7 +91,7 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       //just remember this fixed copy approach!!
       copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);          //one thread copy a int4 = 16bytes = 8 fp16.
       *((copy_t *)&shmem[shmem_row][0]+laneId%2) = *lane_ptr;
-
+      
       //load input
       if(laneId < N<<1){
         lane_ptr = (copy_t *)(input+laneId*8);
@@ -115,6 +115,7 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       
       wmma::load_matrix_sync(P_frag, &shmem[0][0], SHMEM_STRIDE);
       wmma::load_matrix_sync(PT_frag, &shmem[0][0], SHMEM_STRIDE);
+      //wmma::load_matrix_sync(A_frag, &shmem[INPUT_STORE_POINT][0], SHMEM_STRIDE);
       wmma::load_matrix_sync(A_frag, &shmem[INPUT_STORE_POINT][0], SHMEM_STRIDE);
 
       wmma::mma_sync(Vn_frag, P_frag, A_frag, C_frag);//perform V = P x A
@@ -132,7 +133,9 @@ __global__ void compute_reductions16N_warp(const half *input, float *output, int
       printf("kernel complete!\n");
 }
 
-
+/************************
+ * WARP-LEVEL REDUCTION *
+ ************************/
 __global__ void compute_reductions256N_warp(const half *input, float *output, int N){
 
   extern __shared__ half shmem[][16 + SKEW_HALF];
@@ -184,6 +187,45 @@ __global__ void compute_reductions256N_warp(const half *input, float *output, in
 }
 
 
+/*************************
+ * BLOCK-LEVEL REDUCTION *
+ *************************/
+__global__ void compute_reductions256N_block(const half *input, float *output, N){
+  extern __shared__ half shmem[][16 + SKEW_HALF];
+  half *free_use = (half*)&shmem[FREE_USE][0];
+  const unsigned int warpId = threadIdx.x / WARP_SIZE;
+  const unsigned int laneId = threadIdx.x % WARP_SIZE;
+
+  if(warpId==0){
+    typedef int4 copy_t;//vector pointer for fast copy
+    //load P matrix to shared memory
+    int shmem_row = laneId/2;
+    //just remember this fixed copy approach!!
+    copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);          //one thread copy a int4 = 16bytes = 8 fp16.
+    *((copy_t *)&shmem[shmem_row][0]+laneId%2) = *lane_ptr;
+
+     __syncthreads();
+  }
+
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag;
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> V_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> Vn_frag;
+  wmma::fill_fragment(C_frag, 0.0f);
+  //wmma::fill_fragment(Vn_frag, 0.0f);
+  
+  wmma::load_matrix_sync(P_frag, &shmem[0][0], SHMEM_STRIDE);
+  wmma::load_matrix_sync(PT_frag, &shmem[0][0], SHMEM_STRIDE);
+  unsigned int i=0;
+  while(warpId+i){
+    wmma::load_matrix_sync(A_frag, input+i*256, 16);
+    wmma::mma_sync(Vn_frag, P_frag, A_frag, Vn_frag);//perform Vn = P x An+Vn-1
+    i+=WARPS_PER_BLOCK;
+  }
+
+}
 
 
 
@@ -233,7 +275,7 @@ __global__ void shared_to_frag(const half *input, float *output, const int N){
 
 __host__ void init_input(half *input, int size){
   for(float i=0.0;i<size;i++){
-    *(input+(int)i) = (half)(i);
+    *(input+(int)i) = (half)(1.10);
   }
 }
 
@@ -241,7 +283,7 @@ __host__ void init_input(half *input, int size){
 int main(){
 
     half *input_h;
-    int N = 2;
+    int N = (2<<10);
     int input_size = N*256;
 
     float *output_h;
@@ -289,3 +331,4 @@ int main(){
 }
 
 //遗留问题 256N超过一个256就不对
+//block-level reduction
