@@ -177,8 +177,9 @@ __global__ void compute_reductions256N_warp(const half *input, float *output, in
   
     wmma::mma_sync(C_frag, V_frag, PT_frag, C_frag);//perform output = V x PT 
     
-    wmma::store_matrix_sync(output, C_frag, 16, wmma::mem_row_major);
-
+    //wmma::store_matrix_sync(output, C_frag, 16, wmma::mem_row_major);
+    if(threadIdx.x == 0)
+      *output = C_frag.x[0];
   }
 
   
@@ -190,7 +191,7 @@ __global__ void compute_reductions256N_warp(const half *input, float *output, in
 /*************************
  * BLOCK-LEVEL REDUCTION *
  *************************/
-__global__ void compute_reductions256N_block(const half *input, float *output, int N){
+__global__ void compute_reductions256N_block(const half *input, float *output, int N, half *display){
   extern __shared__ half shmem[][16 + SKEW_HALF];
   const unsigned int warpId = threadIdx.x / WARP_SIZE;
   const unsigned int laneId = threadIdx.x % WARP_SIZE;
@@ -229,16 +230,26 @@ __global__ void compute_reductions256N_block(const half *input, float *output, i
 
   wmma::mma_sync(C_frag, V_frag, PT_frag, C_frag);//perform output = V x PT
   
-  
-  if(laneId == 0)
+  __syncthreads();//不加计算结果不正确
+  //debugging
+  //if(warpId == 0){
+    //wmma::store_matrix_sync(display, Vn_frag, 16, wmma::mem_row_major);
+    //printf("%f, ", (float)free_use[laneId]);
+  //}
+
+  if(laneId == 0){
     partial_sums[warpId] = C_frag.x[0];
-    __syncthreads();
+    //printf("%f, ", C_frag.x[0]);
+  }
+  __syncthreads();
   
   float mysum = 0.0f;
   if(threadIdx.x < 8){
     mysum = partial_sums[threadIdx.x];
+    
     for(int offset = 4; offset > 0; offset >>= 1)
       mysum += __shfl_down_sync(0xffffffff, mysum, offset, 8);
+    //printf("%f, ", mysum);
   }
 
   if(threadIdx.x == 0)
@@ -254,8 +265,7 @@ __global__ void compute_reductions256N_block(const half *input, float *output, i
     cub::BlockReduceAlgorithm    ALGORITHM>
 __global__ void BlockSumKernel(
     int         *d_in,          // Tile of input
-    int         *d_out,         // Tile aggregate
-    clock_t     *d_elapsed)     // Elapsed cycle count of block reduction
+    int         *d_out)         // Tile aggregate
 {
     // Specialize BlockReduce type for our thread block
     typedef cub::BlockReduce<int, BLOCK_THREADS, ALGORITHM> BlockReduceT;
@@ -319,63 +329,86 @@ __global__ void shared_to_frag(const half *input, float *output, const int N){
 
 
 
-__host__ void init_input_half(half *input, int size){
-  for(float i=0.0;i<size;i++){
-    *(input+(int)i) = (half)(1.0);
-  }
-}
-__host__ void init_input_int(int *input, int size){
-  for(int i=0.0;i<size;i++){
-    *(input+i) = 1;
+__host__ void init_input(half *input_half, int *input_int,int size){
+  for(int i=0;i<size;i++){
+    input_int[i] = rand() % 3 ;
+    input_half[i] = (half)(float)(input_int[i]);
   }
 }
 
-int sum_wmma_block(half *input, int input_size){
+
+int sum_wmma(half *input, int input_size){
   float res_h = 0.0;
   float *res_d;
 
   half *input_d;
-
+  half *display;
+  half display_h[256];
   //malloc GPU and copy contant data to constant memory
   checkCudaErrors(cudaMalloc(&input_d, 2*input_size));
   checkCudaErrors(cudaMalloc(&res_d, sizeof(float)));
   checkCudaErrors(cudaMemcpyToSymbol(P_d, P_h, CONST_BYTES));
+  //checkCudaErrors(cudaMalloc(&display, 4*16*16));
+
   //copy input to gpu
   checkCudaErrors(cudaMemcpy(input_d, input, 2*input_size, cudaMemcpyHostToDevice));
+
   //launch kernel
-  checkKernelErrors( (compute_reductions256N_block<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, res_d, input_size/256)) );
+  checkKernelErrors( (compute_reductions256N_block<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, res_d, input_size/256, display)) );
+  //checkKernelErrors( (compute_reductions256N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, res_d, input_size/256)) );
+
   //copy result back to cpu
   checkCudaErrors(cudaMemcpy(&res_h, res_d, sizeof(float), cudaMemcpyDeviceToHost));
+  //checkCudaErrors(cudaMemcpy(display_h, display, 2*16*16, cudaMemcpyDeviceToHost));
+
   //free gpu memory and return
   checkCudaErrors(cudaFree(input_d));
+  checkCudaErrors(cudaFree(res_d));
+  //checkCudaErrors(cudaFree(display));
+
+  return res_h;
+}
+
+int sum_cub(int *input, int input_size){
+  int res_h = 0;
+  int *res_d;
+  int *input_d;
+  checkCudaErrors(cudaMalloc(&input_d, sizeof(int)*input_size));
+  checkCudaErrors(cudaMalloc(&res_d, sizeof(int)));
+  checkCudaErrors(cudaMemcpy(input_d, input, sizeof(int)*input_size, cudaMemcpyHostToDevice));
+  BlockSumKernel<THREADS_PER_BLOCK, 1<<12, cub::BLOCK_REDUCE_RAKING><<<1, THREADS_PER_BLOCK>>>(input_d, res_d);
+  checkCudaErrors(cudaMemcpy(&res_h, res_d, sizeof(int), cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaFree(input_d));
+  checkCudaErrors(cudaFree(res_d));
   return res_h;
 }
 
 int main(){
 
-    int N = 8;
+    int N = 1<<12;
     int input_size = N*256;
 
     half *input_h = (half*)malloc(2*input_size);
     int *input_h_cub = (int*)malloc(4*input_size);
-    init_input_half(input_h, input_size);
-    init_input_int(input_h_cub, input_size);
+    init_input(input_h, input_h_cub, input_size);
 
-    float res = sum_wmma_block(input_h, input_size);
-    
-    //launch kernel
-    //checkKernelErrors( (compute_reductions16N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, 15)) );
-    //checkKernelErrors( (compute_reductions256N_warp<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, N)) );
-    //checkKernelErrors( (compute_reductions256N_block<<<1, THREADS_PER_BLOCK, SHMEM_SIZE>>>(input_d, output_d, N)) );
+
+    float res = sum_wmma(input_h, input_size);
     checkCudaErrors(cudaDeviceSynchronize());
+    int res_cub = sum_cub(input_h_cub, input_size);
 
+    float res_cpu = (half)0.0;
+    for(int i=0;i<input_size;i++)
+        res_cpu+=(float)input_h[i];
+    std::cout<<"<-----------------------computing result----------------------->"<<std::endl;
     std::cout<<"result of reduction with tensor core: "<<res<<std::endl;
-    std::cout<<std::endl<<"all complete!"<<std::endl;
+    std::cout<<"result of reduction with CUB: "<<res_cub<<std::endl;
+    std::cout<<"result of reduction with CPU: "<<res_cpu<<std::endl;
+    std::cout<<std::endl<<"all complete!"<<rand()<<std::endl;
 
     free(input_h);
     free(input_h_cub);
     return 0;
 }
 
-//遗留问题 256N超过一个256就不对
 //CUB block level
