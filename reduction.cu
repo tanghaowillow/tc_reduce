@@ -17,7 +17,7 @@
 
 #define SHMEM_SIZE 32*1024
 #define WARP_SIZE 32
-#define WARPS_PER_BLOCK 8
+#define WARPS_PER_BLOCK 16
 #define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
 
 #define CONST_BYTES (16*16*2)
@@ -196,7 +196,7 @@ __global__ void compute_reductions256N_block(const half *input, float *output, i
     copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);          //one thread copy a int4 = 16bytes = 8 fp16
     *((copy_t *)&shmem[shmem_row][0]+laneId%2) = *lane_ptr;  
   }
-  __syncthreads();//如果这里不加, 其他warp就会先执行下面的语句以至于读不到shared memory里的数据
+  __syncthreads();                                        //如果这里不加, 其他warp就会先执行下面的语句以至于读不到shared memory里的数据
   
   wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
   wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
@@ -212,14 +212,14 @@ __global__ void compute_reductions256N_block(const half *input, float *output, i
   unsigned int i=0;
   while(warpId+i < N){
     wmma::load_matrix_sync(A_frag, input+(warpId+i)*256, 16);
-    wmma::mma_sync(Vn_frag, P_frag, A_frag, Vn_frag);//perform Vn = P x An+Vn-1
+    wmma::mma_sync(Vn_frag, P_frag, A_frag, Vn_frag);                 //perform Vn = P x An+Vn-1
     i+=WARPS_PER_BLOCK;
   } 
 
   wmma::store_matrix_sync(free_use, Vn_frag, 16, wmma::mem_row_major);//store Vn to shared memory, because as an accumulator frag Vn cannot be used for computing multiplication
   wmma::load_matrix_sync(V_frag, free_use, 16);                       //load V from Vn as a matrix_a type
   wmma::mma_sync(C_frag, V_frag, PT_frag, C_frag);                    //perform output = V x PT
-  __syncthreads();                                                    //不加计算结果不正确
+  __syncthreads();                                                    
 
   
   if(laneId == 0){
@@ -272,7 +272,7 @@ __global__ void compute_reductions256N_block_opt(const half *input, float *outpu
   while(warpId+i < N){
     wmma::load_matrix_sync(A_frag, input+(warpId+i)*256, 16);
     wmma::mma_sync(Vn_frag, A_frag, PT_frag, Vn_frag);
-    i+=WARPS_PER_BLOCK;
+    i += WARPS_PER_BLOCK;
   }
 
   wmma::store_matrix_sync(res_ptr, Vn_frag, 16, wmma::mem_col_major);                //store Vn to shared memory, because as an accumulator frag Vn cannot be used for computing multiplication
@@ -305,7 +305,6 @@ __global__ void compute_reductions256N_block_opt(const half *input, float *outpu
 
 }
 
-
 /******************************************
  * BLOCK LEVEL REDUCTION WITH CUB LIBRARY *
  ******************************************/
@@ -335,6 +334,66 @@ __global__ void BlockSumKernel(
 }
 
 
+/*******************************
+ * GRID LEVEL REDUCTION KERNEL *
+ *******************************/
+template<int BLOCKS_PER_GIRD>
+__global__ void compute_reductions256N_grid(half *input, float *output, int N){
+
+
+  const unsigned int blockId = blockIdx.x;
+  const unsigned int warpId = threadIdx.x / WARP_SIZE;
+
+  __shared__ half res_warps[16*256];
+  __shared__ float partial_sums[256];
+  half *res_ptr = &(res_warps[warpId*256]);
+
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> V_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> Vn_frag;
+  wmma::fill_fragment(C_frag, 0.0f);
+  wmma::fill_fragment(Vn_frag, 0.0f);
+  wmma::fill_fragment(PT_frag, 1.0f);
+  wmma::fill_fragment(P_frag, 1.0f);
+
+
+  unsigned int i=WARPS_PER_BLOCK * blockId+warpId;
+  
+#pragma unroll
+  while(i < N){
+    wmma::load_matrix_sync(A_frag, input+i*256, 16);
+    wmma::mma_sync(Vn_frag, A_frag, PT_frag, Vn_frag);
+    i += (WARPS_PER_BLOCK * BLOCKS_PER_GIRD);
+  }
+
+  wmma::store_matrix_sync(res_ptr, Vn_frag, 16, wmma::mem_col_major);                //store Vn to shared memory, because as an accumulator frag Vn cannot be used for computing multiplication  
+  __syncthreads();
+
+  if(warpId == 0){
+    wmma::load_matrix_sync(V_frag, res_ptr, 256);
+    wmma::mma_sync(C_frag, P_frag, V_frag, C_frag);
+    wmma::store_matrix_sync(partial_sums, C_frag, 16, wmma::mem_row_major);
+
+  //__syncthreads();
+    float mysum = 0.0f;
+    if(threadIdx.x < 16)
+      mysum = partial_sums[threadIdx.x];
+#pragma unroll 
+    for(int offset = 8; offset > 0; offset >>= 1)
+      mysum += __shfl_down_sync(0xffffffff, mysum, offset, 16);
+      //printf("%f, ", mysum);
+
+    if(threadIdx.x == 0)
+      output[blockId] = mysum;
+  }
+
+}
+
+
+
 /**********************************
  * TEST MEMORY TRANSFER SPEED *
  **********************************/
@@ -345,7 +404,7 @@ __global__ void mem_test(const half *input){
 
   if(warpId==0){
 
-    typedef int4 copy_t;                                          //vector pointer for fast copy
+    typedef int4 copy_t;                                              //vector pointer for fast copy
     //load P matrix to shared memory
     //int shmem_row = laneId/2;
     //copy_t *lane_ptr = (copy_t *)(P_d+laneId*8);
@@ -382,11 +441,39 @@ __global__ void mem_test(const half *input){
 __host__ void init_input(half *input_half, float *input_float,int size){
   srand((int)time(0));
   for(int i=0;i<size;i++){
-    input_float[i] = (float)(rand() % 10);
+    input_float[i] = (float)(rand() % 100);
     //input_half[i] = __float2half(((float)(input_float[i])-1.0f+0.25f));
     input_half[i] = __float2half(((float)(input_float[i]))/100000.0f);
   }
 }
+
+
+ template<int BLOCKS_PER_GIRD>
+ float sum_device(const half *input, const int input_size){
+ 
+   half *input_d;
+   float *res_seq;
+   float *res_d;
+   float res_h = 0;
+
+   checkCudaErrors(cudaMalloc(&input_d, 2*input_size));
+   checkCudaErrors(cudaMalloc(&res_d, sizeof(float)));
+   checkCudaErrors(cudaMalloc(&res_seq, BLOCKS_PER_GIRD*sizeof(float)));
+ 
+   checkCudaErrors(cudaMemcpy(input_d, input, 2*input_size, cudaMemcpyHostToDevice));
+ 
+   checkKernelErrors( (compute_reductions256N_grid<BLOCKS_PER_GIRD><<<BLOCKS_PER_GIRD, THREADS_PER_BLOCK>>>(input_d, res_seq, input_size/256)) );
+   checkCudaErrors(cudaDeviceSynchronize());
+   BlockSumKernel<BLOCKS_PER_GIRD, 1, cub::BLOCK_REDUCE_RAKING, float><<<1, BLOCKS_PER_GIRD>>>(res_seq, res_d);
+  
+   checkCudaErrors(cudaMemcpy(&res_h, res_d, sizeof(float), cudaMemcpyDeviceToHost));
+
+   checkCudaErrors(cudaFree(input_d));
+   checkCudaErrors(cudaFree(res_d));
+   checkCudaErrors(cudaFree(res_seq));
+
+   return res_h;
+ }
 
 
 int sum_wmma(half *input, int input_size){
@@ -436,17 +523,17 @@ int sum_cub(T *input, int input_size){
 
 int main(){
 
-    int N = 1<<2;
+    int N = 1<<16;
     int input_size = N*256;
 
     half *input_h = (half*)malloc(2*input_size);
     float *input_h_cub = (float*)malloc(4*input_size);
     init_input(input_h, input_h_cub, input_size);
 
-    float res_cub = sum_cub<float>(input_h_cub, input_size);
+    //float res_cub = sum_cub<float>(input_h_cub, input_size);
     //checkCudaErrors(cudaDeviceSynchronize());
     //float res = sum_wmma(input_h, input_size);
-    
+    float res_device = sum_device<80>(input_h, input_size);
     
 
     float res_cpu = (half)0.0;
@@ -454,7 +541,8 @@ int main(){
         res_cpu+=__half2float(input_h[i]);
     std::cout<<"<-----------------------computing result----------------------->"<<std::endl;
     //std::cout<<"result of reduction with tensor core: "<<res<<std::endl;
-    std::cout<<"result of reduction with CUB: "<<res_cub<<std::endl;
+    std::cout<<"result of reduction with whole device: "<<res_device<<std::endl;
+    //std::cout<<"result of reduction with CUB: "<<res_cub<<std::endl;
     std::cout<<"result of reduction with CPU: "<<res_cpu<<std::endl;
     std::cout<<std::endl<<"<-----------------------all complete----------------------->"<<std::endl;
 
