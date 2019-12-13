@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cooperative_groups.h>
 #include <mma.h>
 #include <cuda_profiler_api.h>
 #include <cub/cub.cuh> //the CUDA unbound library unbrella head file
@@ -389,10 +390,93 @@ __global__ void compute_reductions256N_grid(half *input, float *output, int N){
     if(threadIdx.x == 0)
       output[blockId] = mysum;
   }
-
+  
 }
 
+//something's still wrong with this func
+template<int BLOCKS_PER_GIRD>
+__global__ void compute_reductions256N_grid_opt(half *input, float *output, int N){
 
+
+  const unsigned int blockId = blockIdx.x;
+  const unsigned int warpId = threadIdx.x / WARP_SIZE;
+
+  __shared__ half res_warps[16*256];
+  __shared__ float partial_sums[256];
+  
+  half *res_ptr = &(res_warps[warpId*256]);
+
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> PT_frag;
+  wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> V_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> Vn_frag;
+  wmma::fill_fragment(C_frag, 0.0f);
+  wmma::fill_fragment(Vn_frag, 0.0f);
+  wmma::fill_fragment(PT_frag, 1.0f);
+  wmma::fill_fragment(P_frag, 1.0f);
+
+
+  unsigned int i=WARPS_PER_BLOCK * blockId+warpId;
+  
+#pragma unroll
+  while(i < N){
+    wmma::load_matrix_sync(A_frag, input+i*256, 16);
+    wmma::mma_sync(Vn_frag, A_frag, PT_frag, Vn_frag);
+    i += (WARPS_PER_BLOCK * BLOCKS_PER_GIRD);
+  }
+
+  wmma::store_matrix_sync(res_ptr, Vn_frag, 16, wmma::mem_col_major);                //store Vn to shared memory, because as an accumulator frag Vn cannot be used for computing multiplication  
+  __syncthreads();
+
+  if(warpId == 0){
+    wmma::load_matrix_sync(V_frag, res_ptr, 256);
+    wmma::mma_sync(C_frag, P_frag, V_frag, C_frag);
+    wmma::store_matrix_sync(partial_sums, C_frag, 16, wmma::mem_row_major);
+
+  //__syncthreads();
+    float mysum = 0.0f;
+    if(threadIdx.x < 16)
+      mysum = partial_sums[threadIdx.x];
+#pragma unroll 
+    for(int offset = 8; offset > 0; offset >>= 1)
+      mysum += __shfl_down_sync(0xffffffff, mysum, offset, 16);
+      //printf("%f, ", mysum);
+
+    if(threadIdx.x == 0)
+      output[blockId] = mysum;
+  }
+  cooperative_groups::this_grid().sync();                                            //gird level sync
+
+  if(blockId == 0){
+    __shared__ float collect[256];
+    float mysum = 0;                                                                    //collect results from blocks
+    collect[threadIdx.x] = threadIdx.x < BLOCKS_PER_GIRD? 1.0f:0.0f;
+    mysum = collect[threadIdx.x];
+
+#pragma unroll
+    for(unsigned int offset = 128;offset>32;offset>>=1){
+      if(threadIdx.x<offset){
+        collect[threadIdx.x] = mysum = mysum + collect[threadIdx.x+offset];
+      }
+    }
+    __syncthreads();
+    //if(threadIdx.x == 0)
+      //for(int i=0;i<256;i++)
+        //printf("%.2f, ", collect[i]);
+
+    if(warpId == 0){
+      collect[threadIdx.x] += collect[threadIdx.x+32];
+      mysum = collect[threadIdx.x];
+      for (int offset = WARP_SIZE/2; offset > 0; offset>>=1) 
+        mysum += __shfl_down_sync(0xffffffff, mysum, offset, 32);
+        
+      if(threadIdx.x == 0)
+        output[0] = mysum;
+    }
+  }
+}
 
 /**********************************
  * TEST MEMORY TRANSFER SPEED *
@@ -438,7 +522,7 @@ __global__ void mem_test(const half *input){
 
 
 
-__host__ void init_input(half *input_half, float *input_float,int size){
+__host__ void init_input(half *input_half, float *input_float,size_t size){
   srand((int)time(0));
   for(int i=0;i<size;i++){
     input_float[i] = (float)(rand() % 100);
@@ -449,7 +533,7 @@ __host__ void init_input(half *input_half, float *input_float,int size){
 
 
  template<int BLOCKS_PER_GIRD>
- float sum_device(const half *input, const int input_size){
+ float sum_wmma_device(const half *input, const size_t input_size){
  
    half *input_d;
    float *res_seq;
@@ -460,12 +544,12 @@ __host__ void init_input(half *input_half, float *input_float,int size){
    checkCudaErrors(cudaMalloc(&res_d, sizeof(float)));
    checkCudaErrors(cudaMalloc(&res_seq, BLOCKS_PER_GIRD*sizeof(float)));
  
-   checkCudaErrors(cudaMemcpy(input_d, input, 2*input_size, cudaMemcpyHostToDevice));
+   checkCudaErrors(cudaMemcpy(input_d, input, sizeof(half)*input_size, cudaMemcpyHostToDevice));
  
    checkKernelErrors( (compute_reductions256N_grid<BLOCKS_PER_GIRD><<<BLOCKS_PER_GIRD, THREADS_PER_BLOCK>>>(input_d, res_seq, input_size/256)) );
-   checkCudaErrors(cudaDeviceSynchronize());
    BlockSumKernel<BLOCKS_PER_GIRD, 1, cub::BLOCK_REDUCE_RAKING, float><<<1, BLOCKS_PER_GIRD>>>(res_seq, res_d);
-  
+   //checkKernelErrors( (compute_reductions256N_grid_opt<BLOCKS_PER_GIRD><<<BLOCKS_PER_GIRD, THREADS_PER_BLOCK>>>(input_d, res_seq, input_size/256)) );
+
    checkCudaErrors(cudaMemcpy(&res_h, res_d, sizeof(float), cudaMemcpyDeviceToHost));
 
    checkCudaErrors(cudaFree(input_d));
@@ -507,7 +591,7 @@ int sum_wmma(half *input, int input_size){
 }
 
 template<class T>
-int sum_cub(T *input, int input_size){
+int sum_cub(T *input, size_t input_size){
   float res_h = 0;
   float *res_d;
   T *input_d;
@@ -521,10 +605,75 @@ int sum_cub(T *input, int input_size){
   return res_h;
 }
 
+float sum_cub_device(const half *input, const size_t input_size){
+  half *input_d;
+  float *res_d;
+  float res_h = 0;
+  float *cub_temp = NULL;
+  size_t cub_temp_byte=0;
+
+  checkCudaErrors(cudaMalloc(&input_d, sizeof(half)*input_size));
+  checkCudaErrors(cudaMalloc(&res_d, sizeof(float)));
+  checkCudaErrors(cudaMemcpy(input_d, input, 2*input_size, cudaMemcpyHostToDevice));
+  cub::DeviceReduce::Sum(cub_temp, cub_temp_byte, input_d, res_d, input_size);//default stream
+  cudaMalloc(&cub_temp, cub_temp_byte);
+  cub::DeviceReduce::Sum(cub_temp, cub_temp_byte, input_d, res_d, input_size);
+  checkCudaErrors(cudaMemcpy(&res_h, res_d, sizeof(float), cudaMemcpyDeviceToHost));
+
+  checkCudaErrors(cudaFree(input_d));
+  checkCudaErrors(cudaFree(res_d));
+  checkCudaErrors(cudaFree(cub_temp));
+
+  return res_h;
+}
+
+template<int BLOCKS_PER_GIRD>
+ float sum_hybrid(const half *input, const size_t input_size){
+  cudaStream_t stream1, stream2;
+  cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking);
+  cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking);
+
+
+  half *input_d;
+  float *res_seq;
+  float *res_d;
+  float res_h[2] = {0,0};
+  float *cub_temp = NULL;
+  size_t cub_temp_byte = 0;
+  float *cub_temp1 = NULL;
+  size_t cub_temp_byte1 = 0;
+
+  checkCudaErrors(cudaMalloc(&input_d, 2*input_size));
+  checkCudaErrors(cudaMalloc(&res_d, 2*sizeof(float)));
+  checkCudaErrors(cudaMalloc(&res_seq, BLOCKS_PER_GIRD*sizeof(float)));
+
+  checkCudaErrors(cudaMemcpy(input_d, input, 2*input_size, cudaMemcpyHostToDevice));
+
+  checkKernelErrors( (compute_reductions256N_grid<BLOCKS_PER_GIRD><<<BLOCKS_PER_GIRD, THREADS_PER_BLOCK, 0, stream1>>>(input_d, res_seq, (input_size/2)/256)) );
+  cub::DeviceReduce::Sum(cub_temp1, cub_temp_byte1, input_d+(input_size/2), res_d+1, (input_size/2), stream2);
+  cub::DeviceReduce::Sum(cub_temp, cub_temp_byte, res_seq, res_d, BLOCKS_PER_GIRD, stream1);
+  cudaMalloc(&cub_temp, cub_temp_byte);
+  cub::DeviceReduce::Sum(cub_temp, cub_temp_byte, res_seq, res_d, BLOCKS_PER_GIRD, stream1);
+  //BlockSumKernel<BLOCKS_PER_GIRD, 1, cub::BLOCK_REDUCE_RAKING, float><<<1, BLOCKS_PER_GIRD, 0, stream1>>>(res_seq, res_d);
+  
+  cudaMalloc(&cub_temp1, cub_temp_byte1);
+  cub::DeviceReduce::Sum(cub_temp1, cub_temp_byte1, input_d+(input_size/2), res_d+1, (input_size/2), stream2);
+
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaMemcpy(&res_h, res_d, 2*sizeof(float), cudaMemcpyDeviceToHost));
+
+  checkCudaErrors(cudaFree(input_d));
+  checkCudaErrors(cudaFree(res_d));
+  checkCudaErrors(cudaFree(cub_temp));
+  checkCudaErrors(cudaFree(res_seq));
+
+  return res_h[0]+res_h[1];
+ }
+
 int main(){
 
-    int N = 1<<16;
-    int input_size = N*256;
+    int N = 1<<20;
+    size_t input_size = N*256;
 
     half *input_h = (half*)malloc(2*input_size);
     float *input_h_cub = (float*)malloc(4*input_size);
@@ -533,16 +682,19 @@ int main(){
     //float res_cub = sum_cub<float>(input_h_cub, input_size);
     //checkCudaErrors(cudaDeviceSynchronize());
     //float res = sum_wmma(input_h, input_size);
-    float res_device = sum_device<80>(input_h, input_size);
+    float res_device = 0.0f;
+    float res_cub = 0.0f;
+    //res_device = sum_hybrid<240>(input_h, input_size);
+    res_cub = sum_cub_device(input_h, input_size);
     
 
-    float res_cpu = (half)0.0;
-    for(int i=0;i<input_size;i++)
+    float res_cpu = 0.0;
+    for(size_t i=0;i<input_size;i++)
         res_cpu+=__half2float(input_h[i]);
     std::cout<<"<-----------------------computing result----------------------->"<<std::endl;
     //std::cout<<"result of reduction with tensor core: "<<res<<std::endl;
-    std::cout<<"result of reduction with whole device: "<<res_device<<std::endl;
-    //std::cout<<"result of reduction with CUB: "<<res_cub<<std::endl;
+    std::cout<<"result of reduction with device_hybrid: "<<res_device<<std::endl;
+    std::cout<<"result of reduction with CUB: "<<res_cub<<std::endl;
     std::cout<<"result of reduction with CPU: "<<res_cpu<<std::endl;
     std::cout<<std::endl<<"<-----------------------all complete----------------------->"<<std::endl;
 

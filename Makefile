@@ -21,7 +21,7 @@ all: run
 
 
 run: reduction.cu
-	$(NVCC) -o run reduction.cu -arch=sm_70 -L$(LIBDIR_CUDA) -lcudart -lcuda  -I ./cub
+	$(NVCC) -o run reduction.cu -arch=sm_70 -rdc=true -L$(LIBDIR_CUDA) -lcudart -lcuda  -I ./cub
 
 clean:
 	find . -name "*.o" -exec rm -f '{}' ';'
