@@ -4,7 +4,8 @@
 
 
 make
-nvprof --print-gpu-trace ./run
+nvprof ./run
+#nvprof --print-gpu-trace ./run
 #nvprof --metrics achieved_occupancy ./run
 
 make clean
